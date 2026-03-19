@@ -191,7 +191,7 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
         max_results=100,
         tweet_fields=["created_at", "text", "author_id", "attachments"],
         expansions=["attachments.media_keys", "author_id"],
-        media_fields=["url", "preview_image_url", "type"],
+        media_fields=["media_key", "url", "preview_image_url", "type"],
         user_fields=["username"],
     )
     tweets = list(resp.data or [])
@@ -213,14 +213,16 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
             username = getattr(u, "username", None) or (u.get("username") if isinstance(u, dict) else None)
             user_by_id[uid] = (username or "").lower()
 
-    return tweets, media_by_key, user_by_id
+    return tweets, media_by_key, user_by_id, len(media)
 
 
-def tweet_image_urls(t, media_by_key: dict) -> list[str]:
+def tweet_image_urls(t, media_by_key: dict, includes_media_count: int) -> list[str]:
     keys: list[str] = []
     attachments_exist = False
+    attachments_raw = None
     try:
-        attachments = getattr(t, "attachments", None) or {}
+        attachments_raw = getattr(t, "attachments", None)
+        attachments = attachments_raw or {}
         attachments_exist = bool(attachments)
         if isinstance(attachments, dict):
             keys = attachments.get("media_keys") or []
@@ -230,7 +232,14 @@ def tweet_image_urls(t, media_by_key: dict) -> list[str]:
         keys = []
         attachments_exist = False
 
-    print(f"YIELDMAX_DEBUG tweet={t.id} attachments_exist={attachments_exist} media_keys={keys}")
+    print(
+        "YIELDMAX_DEBUG "
+        f"tweet={t.id} "
+        f"raw_attachments={attachments_raw} "
+        f"attachments_exist={attachments_exist} "
+        f"media_keys={keys} "
+        f"includes_media_count={includes_media_count}"
+    )
 
     out = []
     for mk in keys:
@@ -252,11 +261,12 @@ def tweet_image_urls(t, media_by_key: dict) -> list[str]:
         )
         if url:
             out.append(force_orig(url))
+
     print(f"YIELDMAX_DEBUG tweet={t.id} image_urls_count={len(out)}")
     return out
 
 
-def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day: date):
+def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, includes_media_count: int, target_day: date):
     """
     YieldMax parser with fail-closed image OCR.
 
@@ -284,7 +294,7 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
             continue
 
         text_pairs = extract_pairs_from_text(txt)
-        img_urls = tweet_image_urls(t, media_by_key)
+        img_urls = tweet_image_urls(t, media_by_key, includes_media_count)
         has_images = bool(img_urls)
         print(f"YIELDMAX_DEBUG tweet={t.id} ocr_branch_entered={'yes' if has_images else 'no'}")
 
@@ -434,14 +444,14 @@ def main():
 
     client = tweepy.Client(bearer_token=bearer, wait_on_rate_limit=True)
 
-    tweets, media_by_key, user_by_id = fetch_announcements(
+    tweets, media_by_key, user_by_id, includes_media_count = fetch_announcements(
         client,
         query=query,
         start_utc=start_utc,
         end_utc=end_utc,
     )
 
-    ym_rows, ym_rejected = parse_yieldmax_rows(tweets, media_by_key, user_by_id, target_day)
+    ym_rows, ym_rejected = parse_yieldmax_rows(tweets, media_by_key, user_by_id, includes_media_count, target_day)
     rh_rows, rh_hits = parse_roundhill_stub_rows(tweets, user_by_id, target_day)
 
     rows = []
