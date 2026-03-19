@@ -182,7 +182,7 @@ def extract_pairs_from_text(text: str) -> dict[str, float]:
 
 def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, end_utc: datetime):
     """
-    Use search_recent_tweets with media + author + referenced tweet expansions.
+    Use search_recent_tweets with media + author expansions.
     """
     resp = client.search_recent_tweets(
         query=query,
@@ -190,16 +190,14 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
         end_time=end_utc.isoformat().replace("+00:00", "Z"),
         max_results=100,
         tweet_fields=["created_at", "text", "author_id", "attachments", "referenced_tweets"],
-        expansions=["attachments.media_keys", "author_id", "referenced_tweets.id"],
-        media_fields=["url", "preview_image_url", "type"],
+        expansions=["attachments.media_keys", "author_id"],
+        media_fields=["media_key", "type", "url", "preview_image_url"],
         user_fields=["username"],
     )
     tweets = list(resp.data or [])
     includes = resp.includes or {}
     media = includes.get("media") or []
     users = includes.get("users") or []
-    included_tweets = includes.get("tweets") or []
-
     media_by_key = {}
     for m in media:
         key = getattr(m, "media_key", None) or (m.get("media_key") if isinstance(m, dict) else None)
@@ -215,7 +213,7 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
             user_by_id[uid] = (username or "").lower()
 
     tweet_by_id = {}
-    for t in tweets + list(included_tweets):
+    for t in tweets:
         tid_raw = getattr(t, "id", None) or (t.get("id") if isinstance(t, dict) else None)
         tid = str(tid_raw or "")
         if tid:
@@ -240,83 +238,6 @@ def get_media_keys_and_attachment_flag(t) -> tuple[list[str], bool]:
     return list(keys), attachments_exist
 
 
-def get_referenced_ids(t) -> list[str]:
-    refs = getattr(t, "referenced_tweets", None) or []
-    out: list[str] = []
-    for ref in refs:
-        rid = getattr(ref, "id", None) or (ref.get("id") if isinstance(ref, dict) else None)
-        if rid is not None:
-            out.append(str(rid))
-    return out
-
-
-def choose_ocr_tweet(base_tweet, tweet_by_id: dict):
-    """
-    Follow referenced tweet chain and prefer the first tweet that has media attachments.
-    If none have media, keep the original tweet.
-    """
-    base_keys, base_has_attachments = get_media_keys_and_attachment_flag(base_tweet)
-    ref_ids = get_referenced_ids(base_tweet)
-    print(
-        "YIELDMAX_DEBUG "
-        f"tweet_id={base_tweet.id} "
-        f"referenced_tweets={ref_ids} "
-        f"current_has_attachments={base_has_attachments}"
-    )
-
-    if base_keys:
-        print(
-            "YIELDMAX_DEBUG "
-            f"tweet_id={base_tweet.id} "
-            f"final_ocr_tweet_id={base_tweet.id} "
-            f"referenced_has_attachments=false"
-        )
-        return base_tweet
-
-    queue = list(ref_ids)
-    visited = {str(base_tweet.id)}
-
-    while queue:
-        rid = queue.pop(0)
-        if rid in visited:
-            continue
-        visited.add(rid)
-        ref_tweet = tweet_by_id.get(rid)
-        if not ref_tweet:
-            print(
-                "YIELDMAX_DEBUG "
-                f"tweet_id={base_tweet.id} "
-                f"referenced_tweet_id={rid} "
-                "referenced_has_attachments=unknown"
-            )
-            continue
-
-        ref_keys, ref_has_attachments = get_media_keys_and_attachment_flag(ref_tweet)
-        print(
-            "YIELDMAX_DEBUG "
-            f"tweet_id={base_tweet.id} "
-            f"referenced_tweet_id={rid} "
-            f"referenced_has_attachments={ref_has_attachments}"
-        )
-        if ref_keys:
-            print(
-                "YIELDMAX_DEBUG "
-                f"tweet_id={base_tweet.id} "
-                f"final_ocr_tweet_id={rid}"
-            )
-            return ref_tweet
-
-        queue.extend(get_referenced_ids(ref_tweet))
-
-    print(
-        "YIELDMAX_DEBUG "
-        f"tweet_id={base_tweet.id} "
-        f"final_ocr_tweet_id={base_tweet.id} "
-        "referenced_has_attachments=false"
-    )
-    return base_tweet
-
-
 def tweet_image_urls(t, media_by_key: dict, base_tweet_id: str | None = None) -> list[str]:
     keys, attachments_exist = get_media_keys_and_attachment_flag(t)
     log_tweet_id = base_tweet_id or str(getattr(t, "id", ""))
@@ -325,8 +246,9 @@ def tweet_image_urls(t, media_by_key: dict, base_tweet_id: str | None = None) ->
         "YIELDMAX_DEBUG "
         f"tweet_id={log_tweet_id} "
         f"ocr_tweet_id={t.id} "
-        f"has_attachments={attachments_exist} "
-        f"media_keys={keys}"
+        f"attachments_exist={attachments_exist} "
+        f"media_keys={keys} "
+        f"includes_media_count={len(media_by_key)}"
     )
 
     out = []
@@ -387,8 +309,7 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, tweet_by_i
             continue
 
         text_pairs = extract_pairs_from_text(txt)
-        ocr_tweet = choose_ocr_tweet(t, tweet_by_id)
-        img_urls = tweet_image_urls(ocr_tweet, media_by_key, base_tweet_id=str(t.id))
+        img_urls = tweet_image_urls(t, media_by_key, base_tweet_id=str(t.id))
         has_images = bool(img_urls)
         print(f"YIELDMAX_DEBUG tweet_id={t.id} ocr_branch_entered={'yes' if has_images else 'no'}")
 
