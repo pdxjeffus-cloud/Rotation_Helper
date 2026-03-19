@@ -182,15 +182,15 @@ def extract_pairs_from_text(text: str) -> dict[str, float]:
 
 def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, end_utc: datetime):
     """
-    Use search_recent_tweets with media + author expansions.
+    Use search_recent_tweets with media + author + referenced tweet expansions.
     """
     resp = client.search_recent_tweets(
         query=query,
         start_time=start_utc.isoformat().replace("+00:00", "Z"),
         end_time=end_utc.isoformat().replace("+00:00", "Z"),
         max_results=100,
-        tweet_fields=["created_at", "text", "author_id", "attachments"],
-        expansions=["attachments.media_keys", "author_id"],
+        tweet_fields=["created_at", "text", "author_id", "attachments", "referenced_tweets"],
+        expansions=["attachments.media_keys", "author_id", "referenced_tweets.id"],
         media_fields=["url", "preview_image_url", "type"],
         user_fields=["username"],
     )
@@ -198,6 +198,7 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
     includes = resp.includes or {}
     media = includes.get("media") or []
     users = includes.get("users") or []
+    included_tweets = includes.get("tweets") or []
 
     media_by_key = {}
     for m in media:
@@ -213,10 +214,17 @@ def fetch_announcements(client: tweepy.Client, query: str, start_utc: datetime, 
             username = getattr(u, "username", None) or (u.get("username") if isinstance(u, dict) else None)
             user_by_id[uid] = (username or "").lower()
 
-    return tweets, media_by_key, user_by_id
+    tweet_by_id = {}
+    for t in tweets + list(included_tweets):
+        tid_raw = getattr(t, "id", None) or (t.get("id") if isinstance(t, dict) else None)
+        tid = str(tid_raw or "")
+        if tid:
+            tweet_by_id[tid] = t
+
+    return tweets, media_by_key, user_by_id, tweet_by_id
 
 
-def tweet_image_urls(t, media_by_key: dict) -> list[str]:
+def get_media_keys_and_attachment_flag(t) -> tuple[list[str], bool]:
     keys: list[str] = []
     attachments_exist = False
     try:
@@ -229,8 +237,97 @@ def tweet_image_urls(t, media_by_key: dict) -> list[str]:
     except Exception:
         keys = []
         attachments_exist = False
+    return list(keys), attachments_exist
 
-    print(f"YIELDMAX_DEBUG tweet={t.id} attachments_exist={attachments_exist} media_keys={keys}")
+
+def get_referenced_ids(t) -> list[str]:
+    refs = getattr(t, "referenced_tweets", None) or []
+    out: list[str] = []
+    for ref in refs:
+        rid = getattr(ref, "id", None) or (ref.get("id") if isinstance(ref, dict) else None)
+        if rid is not None:
+            out.append(str(rid))
+    return out
+
+
+def choose_ocr_tweet(base_tweet, tweet_by_id: dict):
+    """
+    Follow referenced tweet chain and prefer the first tweet that has media attachments.
+    If none have media, keep the original tweet.
+    """
+    base_keys, base_has_attachments = get_media_keys_and_attachment_flag(base_tweet)
+    ref_ids = get_referenced_ids(base_tweet)
+    print(
+        "YIELDMAX_DEBUG "
+        f"tweet_id={base_tweet.id} "
+        f"referenced_tweets={ref_ids} "
+        f"current_has_attachments={base_has_attachments}"
+    )
+
+    if base_keys:
+        print(
+            "YIELDMAX_DEBUG "
+            f"tweet_id={base_tweet.id} "
+            f"final_ocr_tweet_id={base_tweet.id} "
+            f"referenced_has_attachments=false"
+        )
+        return base_tweet
+
+    queue = list(ref_ids)
+    visited = {str(base_tweet.id)}
+
+    while queue:
+        rid = queue.pop(0)
+        if rid in visited:
+            continue
+        visited.add(rid)
+        ref_tweet = tweet_by_id.get(rid)
+        if not ref_tweet:
+            print(
+                "YIELDMAX_DEBUG "
+                f"tweet_id={base_tweet.id} "
+                f"referenced_tweet_id={rid} "
+                "referenced_has_attachments=unknown"
+            )
+            continue
+
+        ref_keys, ref_has_attachments = get_media_keys_and_attachment_flag(ref_tweet)
+        print(
+            "YIELDMAX_DEBUG "
+            f"tweet_id={base_tweet.id} "
+            f"referenced_tweet_id={rid} "
+            f"referenced_has_attachments={ref_has_attachments}"
+        )
+        if ref_keys:
+            print(
+                "YIELDMAX_DEBUG "
+                f"tweet_id={base_tweet.id} "
+                f"final_ocr_tweet_id={rid}"
+            )
+            return ref_tweet
+
+        queue.extend(get_referenced_ids(ref_tweet))
+
+    print(
+        "YIELDMAX_DEBUG "
+        f"tweet_id={base_tweet.id} "
+        f"final_ocr_tweet_id={base_tweet.id} "
+        "referenced_has_attachments=false"
+    )
+    return base_tweet
+
+
+def tweet_image_urls(t, media_by_key: dict, base_tweet_id: str | None = None) -> list[str]:
+    keys, attachments_exist = get_media_keys_and_attachment_flag(t)
+    log_tweet_id = base_tweet_id or str(getattr(t, "id", ""))
+
+    print(
+        "YIELDMAX_DEBUG "
+        f"tweet_id={log_tweet_id} "
+        f"ocr_tweet_id={t.id} "
+        f"has_attachments={attachments_exist} "
+        f"media_keys={keys}"
+    )
 
     out = []
     for mk in keys:
@@ -252,11 +349,17 @@ def tweet_image_urls(t, media_by_key: dict) -> list[str]:
         )
         if url:
             out.append(force_orig(url))
-    print(f"YIELDMAX_DEBUG tweet={t.id} image_urls_count={len(out)}")
+
+    print(
+        "YIELDMAX_DEBUG "
+        f"tweet_id={log_tweet_id} "
+        f"ocr_tweet_id={t.id} "
+        f"image_urls_count={len(out)}"
+    )
     return out
 
 
-def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day: date):
+def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, tweet_by_id: dict, target_day: date):
     """
     YieldMax parser with fail-closed image OCR.
 
@@ -284,16 +387,17 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
             continue
 
         text_pairs = extract_pairs_from_text(txt)
-        img_urls = tweet_image_urls(t, media_by_key)
+        ocr_tweet = choose_ocr_tweet(t, tweet_by_id)
+        img_urls = tweet_image_urls(ocr_tweet, media_by_key, base_tweet_id=str(t.id))
         has_images = bool(img_urls)
-        print(f"YIELDMAX_DEBUG tweet={t.id} ocr_branch_entered={'yes' if has_images else 'no'}")
+        print(f"YIELDMAX_DEBUG tweet_id={t.id} ocr_branch_entered={'yes' if has_images else 'no'}")
 
         chosen_pairs: dict[str, float] = {}
 
         if has_images:
             if not OCR_ENABLED:
                 reason = f"tweet {t.id}: has image(s) but OCR disabled"
-                print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                 rejected.append(reason)
                 continue
 
@@ -312,12 +416,12 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
                     pairs = extract_pairs_from_text(raw)
                 except Exception as e:
                     reason = f"tweet {t.id}: OCR image failed ({e})"
-                    print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                    print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                     rejected.append(reason)
                     ocr_conflict = True
                     break
 
-                print(f"YIELDMAX_DEBUG tweet={t.id} ocr_image_index={checked} ocr_pair_count={len(pairs)}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} ocr_image_index={checked} ocr_pair_count={len(pairs)}")
                 if OCR_DEBUG:
                     print(f"YIELDMAX OCR tweet={t.id} image={checked} pairs={len(pairs)}")
 
@@ -325,7 +429,7 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
                     prev = ocr_pairs_agg.get(sym)
                     if prev is not None and abs(prev - val) > 1e-9:
                         reason = f"tweet {t.id}: OCR conflict for {sym} ({prev} vs {val})"
-                        print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                        print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                         rejected.append(reason)
                         ocr_conflict = True
                         break
@@ -339,7 +443,7 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
 
             if not ocr_pairs_agg:
                 reason = f"tweet {t.id}: has image(s) but OCR found no ticker/amount pairs"
-                print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                 rejected.append(reason)
                 continue
 
@@ -352,26 +456,26 @@ def parse_yieldmax_rows(tweets, media_by_key: dict, user_by_id: dict, target_day
 
             if conflict:
                 reason = f"tweet {t.id}: text/image mismatch ({';'.join(conflict[:5])})"
-                print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                 rejected.append(reason)
                 continue
 
             chosen_pairs = ocr_pairs_agg
-            print(f"YIELDMAX_DEBUG tweet={t.id} accepted_reason=ocr_pairs_used count={len(chosen_pairs)}")
+            print(f"YIELDMAX_DEBUG tweet_id={t.id} accepted_reason=ocr_pairs_used count={len(chosen_pairs)}")
         else:
             if not text_pairs:
                 reason = f"tweet {t.id}: no image and no parseable text pairs"
-                print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                 rejected.append(reason)
                 continue
             chosen_pairs = text_pairs
-            print(f"YIELDMAX_DEBUG tweet={t.id} accepted_reason=text_pairs_used count={len(chosen_pairs)}")
+            print(f"YIELDMAX_DEBUG tweet_id={t.id} accepted_reason=text_pairs_used count={len(chosen_pairs)}")
 
         for sym, amount in sorted(chosen_pairs.items()):
             prev_amt = seen.get(sym)
             if prev_amt is not None and abs(prev_amt - amount) > 1e-9:
                 reason = f"tweet {t.id}: duplicate ticker conflict across tweets for {sym} ({prev_amt} vs {amount})"
-                print(f"YIELDMAX_DEBUG tweet={t.id} rejected_reason={reason}")
+                print(f"YIELDMAX_DEBUG tweet_id={t.id} rejected_reason={reason}")
                 rejected.append(reason)
                 continue
             seen[sym] = amount
@@ -434,14 +538,14 @@ def main():
 
     client = tweepy.Client(bearer_token=bearer, wait_on_rate_limit=True)
 
-    tweets, media_by_key, user_by_id = fetch_announcements(
+    tweets, media_by_key, user_by_id, tweet_by_id = fetch_announcements(
         client,
         query=query,
         start_utc=start_utc,
         end_utc=end_utc,
     )
 
-    ym_rows, ym_rejected = parse_yieldmax_rows(tweets, media_by_key, user_by_id, target_day)
+    ym_rows, ym_rejected = parse_yieldmax_rows(tweets, media_by_key, user_by_id, tweet_by_id, target_day)
     rh_rows, rh_hits = parse_roundhill_stub_rows(tweets, user_by_id, target_day)
 
     rows = []
